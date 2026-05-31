@@ -269,13 +269,29 @@ Repository Input
   -> Repo Source Adapter
   -> Workspace Preparation
   -> Static Analysis / Scanner Suite
-  -> Evidence Builder
-  -> LLM Assessment
-  -> LLM Output Evaluator
-  -> Scoring Engine
+  -> Finding Normalization
+  -> Evidence Builder + EvidenceSelector
+  -> [Multi-Step LLM Pipeline]
+       ThemeExtractor (LLM)
+       ThemeEvidenceValidator (deterministic)
+       RecommendationGenerator (LLM)
+       ReportAssembler (deterministic)
+  -> LLM Output Evaluator (deterministic hard gates)
+  -> Scoring Engine (deterministic)
   -> Report Generator
   -> Storage
   -> Dashboard/API
+```
+
+### Core Design Principle
+
+```text
+The product is AI-assisted but engineering-controlled.
+
+LLM is allowed to interpret, synthesize, and recommend.
+It must not be the sole source of truth.
+Every important conclusion must be grounded in evidence
+and pass deterministic validation before appearing in the final report.
 ```
 
 ## 6. Recommended Demo Architecture
@@ -364,11 +380,20 @@ Recommended excluded folders:
 
 Runs one or more scanner adapters and normalizes their outputs.
 
-Demo scanner adapters:
+The scanner adapter interface is language-agnostic:
 
-- Local Java metrics adapter.
-- Local Python metrics adapter.
-- Optional Semgrep adapter.
+```text
+ScannerAdapter.scan(workspace) -> NormalizedFinding[]
+```
+
+This interface does not change when a new language is added. Adding a new language means implementing a new scanner adapter.
+
+MVP scanner adapter:
+
+- One language scanner for the first demo: Java or Python, depending on implementation capacity. Java is preferred for a bank engineering demo because it is the dominant enterprise language. Python is acceptable if team capacity requires it.
+- Optional Semgrep adapter if available.
+
+Language detection in the workspace manager must handle all supported and unsupported languages. If an unsupported language is detected, the report should include a clear note such as "Language detected but not yet supported."
 
 Future scanner adapters:
 
@@ -378,34 +403,164 @@ Future scanner adapters:
 - Snyk result ingestion.
 - Veracode result ingestion.
 
-## 8.4 Evidence Builder
+## 8.4 Evidence Builder and EvidenceSelector
 
-Builds an evidence package from:
+The Evidence Builder and EvidenceSelector together produce the evidence package, which is the only input allowed for LLM quality assessment.
 
-- Static metrics.
-- Normalized findings.
-- Repo structure.
-- Selected code snippets.
-- Hotspot files.
-- Test file summary.
-- Historical results, when available.
+### 8.4.1 EvidenceSelector
 
-The evidence package is the only input that should be used for LLM quality assessment.
+The EvidenceSelector is a formal component responsible for:
 
-## 8.5 LLM Assessor
+- Ranking files and functions by importance.
+- Selecting top-N findings and snippets.
+- Enforcing a token budget.
+- Validating that every selected evidence item has a stable evidence reference.
+- Producing a bounded, deterministic, reproducible evidence package.
 
-Responsible for:
+#### File Importance Scoring Formula (MVP)
 
-- Building prompts from the evidence package.
-- Calling the approved LLM provider.
-- Requesting schema-constrained structured output.
-- Returning raw and parsed LLM output.
+```text
+file_importance_score =
+  0.5 * normalized_complexity
++ 0.3 * normalized_finding_count
++ 0.2 * normalized_file_size
+```
 
-The LLM should provide engineering judgment, not raw facts.
+Each component is normalized to the range [0, 1] across all files in the repo.
+
+If test coverage data is available in a future version, the formula extends to:
+
+```text
+file_importance_score =
+  0.4 * normalized_complexity
++ 0.3 * normalized_finding_count
++ 0.2 * normalized_file_size
++ 0.1 * normalized_test_gap
+```
+
+`test_gap` measures the degree to which high-complexity or high-risk code lacks test coverage. It is not required for MVP because coverage reports may not be available in the first demo.
+
+#### Token Budget Management (MVP)
+
+The evidence package must be bounded. A hard token limit is applied:
+
+```text
+max_evidence_tokens = configurable (default suggested: 80,000 tokens)
+```
+
+Suggested token allocation:
+
+```text
+repo structure summary: small fixed allocation
+top findings: main allocation
+selected snippets: main allocation
+reserved output budget: minimum fixed reservation
+```
+
+The allocation does not need to be precisely optimized in MVP. The key requirement is that the evidence package is bounded before the LLM call, and the actual token count is logged per scan.
+
+#### Phase 2 Enhancements (Do Not Implement in MVP)
+
+The following enhancements are deferred:
+
+- File centrality and dependency graph analysis.
+- Churn × complexity temporal signal (requires git history or Bitbucket integration).
+- Embedding-based evidence retrieval.
+
+These will be documented in a Phase 2 specification.
+
+### 8.4.2 Evidence Builder
+
+Combines the outputs of the EvidenceSelector with repo metadata to produce the final evidence package:
+
+- Repo summary (language breakdown, top-level structure).
+- Selected normalized findings with evidence refs.
+- Selected code snippets with file path and line ranges.
+- Test file summary if available.
+- Explicit list of unknowns (missing coverage, unsupported language, incomplete scanner output).
+- Versions (evidence builder version, scanner versions).
+
+## 8.5 LLM Assessment Pipeline (Multi-Step)
+
+The LLM assessment uses a multi-step pipeline instead of a single large LLM call. Each step is smaller, focused, and validated before passing its output to the next step.
+
+### Step 1: ThemeExtractor (LLM)
+
+The LLM receives the evidence package and identifies the top 3–5 quality themes.
+
+Requirements:
+- Each theme must reference at least one evidence ID from the evidence package.
+- The LLM must provide a concise rationale summary for each theme, citing the supporting evidence.
+- Output must be schema-valid (use Claude Bedrock tool use or structured output to enforce this at the API level).
+
+Note: Tool use or structured output reduces JSON formatting failures. It does not eliminate the need for semantic validation. The content of the output (evidence references, file paths, claim scope) must still be validated in Step 2.
+
+### Step 2: ThemeEvidenceValidator (Deterministic)
+
+A deterministic validator checks the ThemeExtractor output:
+
+- All evidence references cited in themes exist in the evidence package.
+- Referenced file paths exist in the workspace.
+- Referenced class or function names exist in the findings.
+- No hallucinated identifiers appear in the theme output.
+- Theme output passes required field checks.
+
+If validation fails, the theme is rejected and a targeted repair prompt is sent back to the ThemeExtractor (up to max retry count). If retry fails, the scan falls back to a static-only report.
+
+### Step 3: RecommendationGenerator (LLM)
+
+For each validated theme, the LLM generates a specific engineering recommendation.
+
+Requirements:
+- Recommendations must target a specific module, file, or function.
+- Recommendations must include the specific change recommended.
+- Recommendations must include the expected benefit.
+- The LLM must not introduce new file, class, or function names that were not in the validated themes.
+
+### Step 4: ReportAssembler (Deterministic)
+
+A deterministic component assembles the final report:
+
+- Combines validated themes and recommendations.
+- Computes the final Code Quality Score using the deterministic scoring engine.
+- Computes the LLM Report Quality Score.
+- Attaches evaluation metadata.
+- Writes the structured final report JSON.
+
+The LLM does not compute the final Code Quality Score. The score is always computed deterministically.
+
+A role-specific SummaryGenerator LLM step may be added in Phase 2 but is not required for MVP.
 
 ## 8.6 LLM Output Evaluator
 
-Responsible for validating the LLM report.
+The evaluator enforces hard gates before any LLM output is accepted as part of the final report.
+
+### Hard Gate Checks (Deterministic, Always Run)
+
+These checks are implemented in code, not by an LLM:
+
+- Schema is valid and required fields are present.
+- Evidence references exist in the evidence package.
+- Referenced file paths exist in the repo workspace.
+- Referenced line ranges are valid when provided.
+- No hallucinated file, class, or function names appear in the report.
+- Final score is within valid range.
+- Report can be stored and rendered.
+
+Failure in any hard gate check triggers a targeted repair prompt or fallback to static report.
+
+### Soft Quality Checks (MVP)
+
+These are recorded as scores but do not block the report:
+
+- Actionability: are recommendations specific enough for engineers to act on?
+- Unknowns coverage: are missing inputs explicitly listed?
+- Evidence coverage: what percentage of claims are grounded?
+- Confidence level: based on scanner completeness and evaluation results.
+
+### Soft Quality Checks via LLM-as-Judge (Phase 2)
+
+LLM-as-judge evaluation for qualitative dimensions (actionability, clarity, recommendation usefulness, role-specific summary quality) may be added in Phase 2. In MVP, soft checks should use deterministic heuristics (keyword patterns, field completeness, reference counts).
 
 Possible final statuses:
 
@@ -414,29 +569,46 @@ Possible final statuses:
 - `RETRY_REQUIRED`
 - `FAILED_FALLBACK_TO_STATIC_REPORT`
 
-## 8.7 Scoring Engine
+## 8.7 Scoring Engine (Deterministic)
 
-Computes deterministic score from metrics and accepted LLM assessment.
+The Scoring Engine computes two separate scores deterministically.
 
-Recommended MVP approach:
+### Code Quality Score
 
-- Static metrics dominate the score.
-- LLM contributes a smaller advisory component.
-- LLM must not be the sole source of the final score.
+Measures how healthy or risky the repository is.
 
-Example weighting:
+Inputs: static metrics and normalized findings from the Scanner Suite.
+
+The LLM does not compute the Code Quality Score. The LLM may contribute qualitative assessments that inform the `risk_signals` component, but the score formula is always deterministic.
 
 ```text
-Overall Score =
+Code Quality Score =
   25% Maintainability
 + 20% Complexity
 + 15% Duplication
 + 15% Test Coverage or Test Presence Proxy
 + 15% Risk Signals
-+ 10% LLM Architecture/Readability Assessment
++ 10% Architecture/Design Signal (from validated LLM themes, advisory only)
 ```
 
-For the first demo, if test coverage is unavailable, use a placeholder or test presence proxy and clearly mark confidence limitations.
+If test coverage is unavailable, use a test presence proxy and mark the confidence limitation in the report.
+
+### LLM Report Quality Score
+
+Measures how trustworthy the LLM-generated report is.
+
+Computed by the evaluator after hard gate checks:
+
+```text
+LLM Report Quality Score =
+  30% Grounding (evidence reference coverage)
++ 20% Schema Correctness
++ 20% Consistency (severity vs. risk level vs. score)
++ 20% Actionability (recommendation specificity)
++ 10% Conciseness / Clarity
+```
+
+Both scores must be displayed separately in the dashboard.
 
 ## 8.8 Report Generator
 
@@ -592,14 +764,18 @@ code-quality-platform/
 
     evidence/
       builder.py
+      selector.py
       snippet_selector.py
       repo_summarizer.py
+      token_budget.py
 
     llm/
       bedrock_client.py
       prompt_builder.py
       schemas.py
-      assessor.py
+      theme_extractor.py
+      recommendation_generator.py
+      report_assembler.py
       evaluator.py
 
     storage/
@@ -694,6 +870,59 @@ The platform does not block releases or merges in the demo version.
 Rationale:
 
 The assessment system must establish trust before being used in any gating workflow.
+
+### ADR-007: AI-Assisted but Engineering-Controlled
+
+Decision:
+
+The LLM is allowed to interpret, synthesize, and recommend. It must not be the sole source of truth. Every important conclusion must be grounded in evidence and pass deterministic validation before appearing in the final report.
+
+Rationale:
+
+This keeps the system trustworthy for a regulated enterprise audience. It also means the system degrades gracefully — if the LLM fails or is unavailable, a static-only report is still produced.
+
+### ADR-008: Multi-Step LLM Pipeline Over Single Large Call
+
+Decision:
+
+The LLM assessment uses a 4-step pipeline: ThemeExtractor (LLM) → ThemeEvidenceValidator (deterministic) → RecommendationGenerator (LLM) → ReportAssembler (deterministic). The final report is assembled by a deterministic component.
+
+Rationale:
+
+A single large LLM call that extracts themes, generates recommendations, writes summaries, and outputs final JSON has too many failure modes. Breaking the pipeline into validated steps reduces hallucination scope, makes repair prompts more targeted, and enables deterministic assembly of the final report.
+
+### ADR-009: Structured Output to Reduce Format Failures
+
+Decision:
+
+Use Claude Bedrock tool use or structured output (e.g., `tool_choice: {"type": "tool"}`) for each LLM step to enforce schema at the API level.
+
+Rationale:
+
+Tool use ensures that each LLM step output is structurally valid JSON that matches the declared schema. This reduces format-related retry failures. It does not eliminate the need for semantic validation. Evidence references, file path existence, and claim scope must still be validated by the deterministic evaluator.
+
+### ADR-010: MVP Language Scope
+
+Decision:
+
+The first demo scanner implements one language: Java (preferred for a bank engineering demo) or Python (acceptable if team capacity requires it). The scanner adapter interface is language-agnostic from day 1.
+
+Rationale:
+
+Implementing one language first reduces complexity and allows the team to complete the end-to-end pipeline. The adapter interface ensures that adding the second language requires only a new scanner implementation, not changes to the evidence builder, LLM pipeline, evaluator, or dashboard.
+
+### ADR-011: Deferred Enhancements
+
+The following capabilities are out of scope for MVP and documented as Phase 2 targets:
+
+- Churn × complexity temporal signal (requires git history or Bitbucket integration).
+- File centrality and dependency graph analysis.
+- Embedding-based evidence retrieval.
+- Self-consistency sampling (available as `--stability-check` flag in CLI, not default).
+- LLM-as-judge soft evaluation.
+- Role-specific SummaryGenerator LLM step.
+- SonarQube, CodeQL, Checkmarx, Snyk, Veracode scanner adapters.
+- Portfolio-level multi-repo analysis.
 
 ## 12. Open Questions
 

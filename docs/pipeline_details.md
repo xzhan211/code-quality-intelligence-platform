@@ -15,14 +15,30 @@ User
   -> Prepare Workspace
   -> Run Static Analysis
   -> Normalize Findings
+  -> EvidenceSelector (rank, select, enforce token budget)
   -> Build Evidence Package
-  -> Run LLM Assessment
-  -> Evaluate LLM Output
+  -> [Multi-Step LLM Pipeline]
+       Step 1: ThemeExtractor (LLM call, structured output via tool use)
+       Step 2: ThemeEvidenceValidator (deterministic)
+       Step 3: RecommendationGenerator (LLM call, per validated theme)
+       Step 4: ReportAssembler (deterministic, no LLM)
+  -> LLM Output Evaluator (deterministic hard gates)
   -> Retry / Accept / Fallback
-  -> Compute Final Score
+  -> Compute Final Score (deterministic)
   -> Generate Report
   -> Store Results
   -> Show Dashboard
+```
+
+### Design Principle
+
+```text
+The product is AI-assisted but engineering-controlled.
+
+LLM interprets, synthesizes, and recommends.
+Deterministic components validate, score, and assemble.
+Every conclusion must be grounded in evidence and pass validation
+before appearing in the final report.
 ```
 
 ## 3. Runtime Modes
@@ -297,47 +313,64 @@ Convert scanner-specific outputs into a common finding schema.
 NormalizedFinding[]
 ```
 
-## Stage 6: Evidence Package Build
+## Stage 6: Evidence Package Build (EvidenceSelector + Evidence Builder)
 
 ### Input
 
 - Normalized findings.
 - Workspace metadata.
 - Repo tree.
-- Selected source snippets.
-- Optional historical scan data.
+- Scan config (including max_evidence_tokens).
 
-### Processing
+### Stage 6a: EvidenceSelector
 
-Evidence builder selects and packages the information that the LLM is allowed to use.
+The EvidenceSelector ranks files and functions by importance and enforces the token budget before building the evidence package.
 
-Recommended inputs to LLM:
+#### File Importance Scoring (MVP)
 
-- Repo summary.
-- Language/framework detection.
-- Top complex files/functions.
-- Top duplicated or suspicious repeated patterns.
-- Top scanner findings.
-- Selected code snippets.
-- Test file summary.
-- Unknowns and missing data.
+```text
+file_importance_score =
+  0.5 * normalized_complexity
++ 0.3 * normalized_finding_count
++ 0.2 * normalized_file_size
+```
 
-### Snippet Selection Rules
+Each factor is normalized to [0, 1] across all files in the repo. The top-N files by this score are selected for snippet inclusion.
+
+#### Token Budget Enforcement
+
+A hard token limit is applied before the evidence package is sent to any LLM step:
+
+```text
+max_evidence_tokens = configurable (default: 80,000)
+```
+
+If the selected evidence exceeds the budget, lower-ranked findings and snippets are dropped until the package fits. The final token count is logged per scan.
+
+#### Snippet Selection Rules
 
 Prefer snippets from:
 
-- Top complexity findings.
-- Repeated logic findings.
-- Large service/controller/repository files.
+- Top-ranked files by importance score.
+- Functions flagged by complexity findings.
 - Files with multiple findings.
-- Representative test files.
 
 Avoid:
 
 - Binary files.
 - Generated files.
-- Very large files without selection.
 - Secrets or credentials when detected.
+- Very large files without specific selection.
+
+#### Phase 2 Enhancements (Deferred)
+
+- File centrality from import/dependency graph.
+- Churn × complexity signal from git history.
+- Embedding-based evidence retrieval.
+
+### Stage 6b: Evidence Builder
+
+Combines EvidenceSelector output with repo metadata into the final evidence package.
 
 ### Evidence Package Schema
 
@@ -348,7 +381,7 @@ Avoid:
   "repo": {
     "tenant": "demo",
     "repo_name": "payment-service",
-    "languages": ["Java", "Python"],
+    "languages": ["Java"],
     "branch": "main",
     "commit_sha": null
   },
@@ -357,8 +390,10 @@ Avoid:
   "findings": [],
   "snippets": [],
   "unknowns": [],
+  "token_count": 42000,
   "versions": {
-    "evidence_builder_version": "v1.0"
+    "evidence_builder_version": "v1.0",
+    "evidence_selector_version": "v1.0"
   }
 }
 ```
@@ -366,57 +401,159 @@ Avoid:
 ### Output
 
 ```text
-EvidencePackage
+EvidencePackage (bounded, schema-valid, reproducible)
 ```
 
-## Stage 7: LLM Assessment
+## Stage 7: LLM Assessment (Multi-Step Pipeline)
 
-### Input
+A single large LLM call is replaced by a 4-step pipeline. Each LLM step is smaller, focused, and validated before its output is used in the next step.
+
+### Step 7a: ThemeExtractor (LLM Call)
+
+#### Input
 
 - Evidence package.
-- Prompt version.
-- Rubric version.
-- Model config.
+- ThemeExtractor prompt (versioned).
+- Model config (Claude Bedrock, structured output via tool use).
 
-### Processing
+#### Processing
 
-LLM assessor sends a schema-constrained prompt to the approved model.
+The LLM receives the evidence package and identifies the top 3–5 quality themes. Structured output (tool use) is used to enforce schema at the API level.
 
-### LLM Responsibilities
+LLM responsibilities in this step:
+- Identify the top quality themes from the evidence.
+- For each theme, provide a concise rationale citing supporting evidence.
+- Each theme must reference at least one `evidence_ref` from the evidence package.
 
-- Group findings into quality themes.
-- Explain engineering impact.
-- Identify cross-file maintainability risks.
-- Prioritize refactor recommendations.
-- Produce role-aware summary.
-- Explicitly list unknowns.
+The LLM must not invent file names, class names, or function names that are not in the evidence package.
 
-### Output
+#### Output
+
+```json
+{
+  "themes": [
+    {
+      "theme_id": "theme-001",
+      "title": "High-complexity payment processing logic",
+      "severity": "high",
+      "evidence_refs": ["finding:finding-005", "snippet:snippet-002"],
+      "rationale": "PaymentService.process_payment has cyclomatic complexity of 18 ..."
+    }
+  ]
+}
+```
+
+### Step 7b: ThemeEvidenceValidator (Deterministic)
+
+#### Processing
+
+Validates each theme from the ThemeExtractor output:
+
+- All `evidence_refs` cited in each theme exist in the evidence package.
+- Referenced file paths exist in the workspace.
+- Referenced class or function names exist in the normalized findings.
+- No hallucinated identifiers are present.
+- Required theme fields are present.
+
+Invalid themes are rejected. A targeted grounding repair prompt is sent if any themes fail (up to max retry). If retry fails, the scan falls back to static-only report.
+
+#### Output
 
 ```text
-RawLLMOutput
-ParsedLLMReport optional
+ValidatedThemes[]
+```
+
+### Step 7c: RecommendationGenerator (LLM Call)
+
+#### Input
+
+- Validated themes.
+- RecommendationGenerator prompt (versioned).
+- Model config.
+
+#### Processing
+
+For each validated theme, the LLM generates a specific engineering recommendation.
+
+Requirements:
+- Target a specific module, file, or function.
+- Describe the specific change recommended.
+- Explain the expected benefit.
+- Do not introduce new identifiers not present in the validated theme evidence.
+
+#### Output
+
+```json
+{
+  "recommendations": [
+    {
+      "theme_id": "theme-001",
+      "target": "PaymentService.process_payment",
+      "recommended_change": "Extract validation logic into PaymentValidationPolicy ...",
+      "expected_benefit": "Reduces cyclomatic complexity from 18 to under 10 ...",
+      "priority": "high"
+    }
+  ]
+}
+```
+
+### Step 7d: ReportAssembler (Deterministic)
+
+Assembles the final structured LLM report from validated themes and recommendations. No LLM call is made in this step.
+
+- Combines validated themes with their recommendations.
+- Attaches evidence package metadata.
+- Records prompt versions, model ID, and LLM usage metadata (input tokens, output tokens per step).
+- Produces a structured report ready for the evaluator.
+
+The LLM does not compute the final Code Quality Score. Score computation happens in Stage 10.
+
+#### Output
+
+```text
+AssembledLLMReport (structured, deterministic)
 ```
 
 ## Stage 8: LLM Output Evaluation
 
 ### Input
 
-- Raw/parsed LLM report.
+- Assembled LLM report (from ReportAssembler).
 - Evidence package.
-- Repo tree.
+- Repo workspace.
 - Evaluation config.
 
-### Processing
+### Processing: Hard Gate Checks (Deterministic — Must Pass)
 
-Run evaluator checks:
+These checks are implemented in code and must not use an LLM:
 
-- Schema validation.
-- Evidence reference validation.
-- File path validation.
-- Hallucination detection.
-- Severity consistency.
-- Recommendation actionability.
+- Schema is valid and required fields are present.
+- Evidence references cited in themes exist in the evidence package.
+- Referenced file paths exist in the repo workspace.
+- Referenced line ranges are valid when provided.
+- No hallucinated file, class, or function names appear in the assembled report.
+- Final assembled structure can be stored and rendered without error.
+
+If any hard gate fails, a targeted repair prompt is triggered (up to max retry). If retries are exhausted, fall back to static-only report.
+
+### Processing: Soft Quality Checks (Deterministic Heuristics)
+
+These are computed and stored but do not block report acceptance:
+
+- Grounding score: percentage of themes with at least one valid evidence reference.
+- Consistency score: does risk level match severity distribution?
+- Actionability score: deterministic check on recommendation field completeness (target module, specific change, expected benefit present).
+- Evidence coverage: percentage of quality themes that are grounded.
+- Unknowns coverage: are missing inputs explicitly listed?
+
+### Note on Structured Output and Semantic Validation
+
+Using Claude Bedrock tool use reduces JSON formatting failures. It does not eliminate the need for semantic validation. Evidence references, file path existence, and claim scope must still be validated by the hard gate evaluator.
+
+```text
+Tool use reduces format failures.
+Semantic validation and repair are still required.
+```
 
 ### Output Statuses
 
@@ -438,7 +575,11 @@ FAILED_FALLBACK_TO_STATIC_REPORT
   "actionability_score": 0.81,
   "hallucination_count": 0,
   "retry_count": 0,
-  "failure_reasons": []
+  "failure_reasons": [],
+  "llm_usage": [
+    {"step": "theme_extractor", "model_id": "...", "input_tokens": 8200, "output_tokens": 420},
+    {"step": "recommendation_generator", "model_id": "...", "input_tokens": 3100, "output_tokens": 680}
+  ]
 }
 ```
 
@@ -479,42 +620,56 @@ If LLM output remains invalid:
 - Store failure reasons.
 - Scan should still complete if static analysis succeeded.
 
-## Stage 10: Final Scoring
+## Stage 10: Final Scoring (Deterministic)
+
+The scoring engine computes two separate scores. Both are fully deterministic. The LLM does not compute either score.
 
 ### Input
 
 - Normalized findings.
 - Static metrics.
-- Accepted or warning-level LLM report.
-- Evaluation result.
+- Validation result from Stage 8.
+- LLM report (accepted or fallback).
 
-### Processing
+### Code Quality Score
 
-Compute final score using deterministic formula.
-
-Recommended MVP formula:
+Measures the quality and risk level of the repository.
 
 ```text
-Overall Score =
-  25% Maintainability
-+ 20% Complexity
-+ 15% Duplication
+Code Quality Score =
+  25% Maintainability (from static metrics)
++ 20% Complexity (from scanner findings)
++ 15% Duplication (from scanner findings)
 + 15% Test Coverage or Test Presence Proxy
-+ 15% Risk Signals
-+ 10% LLM Architecture/Readability Assessment
++ 15% Risk Signals (from normalized findings)
++ 10% Architecture/Design Signal (from validated LLM themes, advisory only)
 ```
 
-If LLM report is failed:
+If the LLM report failed, exclude the Architecture/Design Signal component and reduce score confidence accordingly.
 
-- Exclude LLM component.
-- Mark score confidence lower.
+If test coverage is unavailable, use a test presence proxy and mark the limitation explicitly in the report.
+
+### LLM Report Quality Score
+
+Measures how trustworthy the LLM-generated report is.
+
+```text
+LLM Report Quality Score =
+  30% Grounding
++ 20% Schema Correctness
++ 20% Consistency
++ 20% Actionability
++ 10% Conciseness / Clarity
+```
 
 ### Output
 
 ```text
-FinalScore
+FinalScore (Code Quality Score)
+LLMReportQualityScore
 RiskLevel
 ScoreBreakdown
+ScoreConfidence
 ```
 
 ## Stage 11: Report Generation
@@ -570,23 +725,35 @@ Raw Results
 
 ### Important Dashboard Signals
 
-Show both:
+Show both scores separately on every report page:
 
 ```text
-Code Quality Score
-LLM Report Quality / Confidence
-```
-
-Example:
-
-```text
-Quality Score: 72 / 100
+Code Quality Score: 72 / 100
 Risk Level: Medium
+---
+LLM Report Quality Score: 88 / 100
 LLM Report Confidence: High
 Validation Status: Passed
 Evidence Coverage: 91%
 Retry Count: 0
+Prompt Version: v1.0
+Model: claude-3-5-sonnet
 ```
+
+### Story-Mode Demo Flow (Leadership Demo)
+
+The dashboard should support a guided demo narrative for leadership presentations. The demo should show the following sequence using a synthetic repo with intentional quality problems (e.g., a Java or Python payment-service):
+
+1. Upload the repo archive and trigger a scan.
+2. Show static findings and metrics (complexity hotspots, large files, findings count).
+3. Show the EvidenceSelector output — which files were selected and why (importance scores).
+4. Show the ThemeExtractor output — what quality themes the LLM identified, with evidence refs.
+5. Show the evaluator in action — demonstrate a rejected output: for example, the LLM hallucinated a class name that does not exist. Show that the evaluator caught it and triggered a repair prompt.
+6. Show the accepted report after repair: themes, recommendations with evidence refs, score breakdown.
+7. Show both Code Quality Score and LLM Report Quality Score separately.
+8. Show a recommendation with its evidence trail — click from recommendation to the finding to the source snippet.
+
+The goal is to show leadership that this is not a black-box AI wrapper. It is an evidence-grounded engineering quality platform where every recommendation can be traced back to the source code and every LLM output passes deterministic validation.
 
 ## 5. Data Flow by Artifact
 

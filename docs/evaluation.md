@@ -33,6 +33,23 @@ Practical implications:
 - Prompt, rubric, model, scanner, and evaluator versions must be stored.
 - The system must support fallback to static-only reports when LLM output is unreliable.
 
+### Structured Output and Semantic Validation
+
+Using Claude Bedrock tool use or structured output enforces schema validity at the API level. This reduces JSON formatting failures and eliminates most schema-related retry needs.
+
+However, structured output does not replace semantic validation. The evaluator must still verify:
+
+- Whether evidence references exist in the evidence package.
+- Whether file paths, class names, and function names exist in the repo.
+- Whether severity is consistent with evidence strength.
+- Whether recommendations are specific enough to be actionable.
+- Whether the LLM has cited anything outside the evidence package.
+
+```text
+Tool use reduces format failures.
+Semantic validation and repair are still required.
+```
+
 ## 3. What Needs to Be Evaluated
 
 ## 3.1 Static Evidence Quality
@@ -256,7 +273,15 @@ Failure action:
 
 ## 5.5 Stability Evaluation
 
-For the demo, stability evaluation can be part of offline test/evaluation mode rather than every production scan.
+Stability evaluation runs the same scan multiple times and checks for consistency. It is not part of the normal scan path.
+
+For MVP, stability evaluation is available only as an optional CLI flag:
+
+```text
+code-quality scan --stability-check --runs 3
+```
+
+This flag should not be enabled by default because it increases cost and latency.
 
 Checks:
 
@@ -388,13 +413,28 @@ llm_report_evaluation
 - grounding_score
 - consistency_score
 - actionability_score
-- stability_score optional
+- stability_score (Phase 2, optional)
 - hallucination_count
 - retry_count
 - final_status
 - failure_reasons
 - created_at
 ```
+
+Model usage metadata must also be stored per scan to support cost analysis:
+
+```text
+llm_usage_metadata
+- scan_run_id
+- llm_step (theme_extractor, recommendation_generator, etc.)
+- model_id
+- input_tokens
+- output_tokens
+- retry_count
+- estimated_cost_when_available
+```
+
+Cost should be measured and recorded, not estimated in the design.
 
 ## 9. Report Quality Score
 
@@ -518,27 +558,39 @@ Human review should not block every scan, but it should guide system calibration
 
 The first demo should implement:
 
-### Hard Gate Checks
+### Hard Gate Checks (Deterministic — Always Run)
 
-- JSON schema validation.
-- Evidence reference validation.
-- File path validation.
-- Required field validation.
-- Basic score/risk/severity consistency check.
+Hard gate checks are implemented in code. They must not use an LLM.
 
-### Soft Quality Checks
+- JSON schema validation and required field check.
+- Evidence reference validation (all evidence_refs cited by LLM exist in the evidence package).
+- File path validation (referenced file paths exist in the repo workspace).
+- Line range validation when line ranges are provided.
+- Hallucination detection: referenced class, function, or module names must exist in the workspace or findings.
+- Final score is within valid range.
+- Report can be stored and rendered without error.
 
-- Actionability score.
-- Unknowns count.
-- Evidence coverage.
-- Confidence level.
+Failure in any hard gate check triggers a targeted repair prompt or fallback.
 
-### Retry/Fallback
+### Soft Quality Checks (Deterministic Heuristics — MVP)
+
+These are computed and recorded but do not block report acceptance:
+
+- Actionability score: deterministic heuristic based on recommendation field completeness (target module present, specific change described, expected benefit stated).
+- Unknowns count: how many missing inputs are explicitly listed.
+- Evidence coverage: what percentage of quality themes have at least one valid evidence reference.
+- Confidence level: derived from scanner completeness and evaluation pass rate.
+
+### Soft Quality Checks via LLM-as-Judge (Phase 2 — Defer)
+
+LLM-as-judge evaluation for qualitative dimensions (actionability nuance, clarity, recommendation usefulness, role-specific summary quality) is a Phase 2 enhancement. It should not replace deterministic hard gates. It should supplement them with qualitative scoring.
+
+### Retry and Fallback
 
 - Max 2 retries.
-- Targeted repair prompts.
-- Fallback to static-only report.
-- Store retry/evaluation metadata.
+- Targeted repair prompts (schema repair, grounding repair, consistency repair).
+- Fallback to static-only report if all retries fail.
+- Store retry count, failure reasons, and raw failed outputs for audit.
 
 ## 14. Success Criteria
 

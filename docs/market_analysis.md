@@ -232,7 +232,107 @@ These tools validate the market need for code quality visibility. However, the i
 
 ---
 
-### 3.8 AI Code Review Products, such as CodeRabbit
+### 3.8 CAST Highlight and CAST Imaging
+
+#### Positioning
+
+CAST Highlight is an enterprise portfolio-level code quality and cloud-readiness analysis platform. CAST Imaging provides architecture visualization and software blueprint analysis for large enterprise applications. Both products are used by major banks and financial institutions.
+
+CAST Highlight provides portfolio-level technical debt measurement, maintainability scoring, open-source risk, and cloud-readiness assessment across large application landscapes. CAST Imaging provides structural analysis of application architecture, including layer analysis, component coupling, and technical debt localization.
+
+#### Strengths
+
+- Strong enterprise adoption in regulated industries including banking.
+- Portfolio-level visibility across many applications and teams.
+- Architecture blueprint analysis and coupling visualization.
+- Technical debt quantified in remediation hours, which resonates with management.
+- CAST research papers provide academic credibility for technical debt measurement.
+
+#### Limitations
+
+- CAST is primarily metrics- and rule-based and does not provide LLM-based synthesis of engineering judgment.
+- The "so what" narrative — what does this mean for our team and what should we do next — is still left to the engineer.
+- CAST Imaging can be expensive and complex to deploy for smaller teams or internal demos.
+
+#### Relevance to our app
+
+CAST is the closest commercial analog to what we are building. Our product adds the synthesis and recommendation layer that CAST's metrics-only approach lacks. If the organization already uses CAST, our app can complement it by providing LLM-based analysis on top of CAST findings. Differentiation: we provide actionable engineering recommendations, evidence-grounded LLM synthesis, and role-specific summaries that CAST does not generate.
+
+---
+
+### 3.9 CodeScene
+
+#### Positioning
+
+CodeScene is a behavioral code analysis platform that combines source code complexity metrics with version control history (git churn) to identify high-risk hotspots. It is used by enterprises and large software teams to detect areas of the codebase that are both complex and frequently changed.
+
+#### Strengths
+
+- Hotspot analysis: files that are both complex and frequently modified are statistically more likely to contain bugs and be harder to maintain.
+- Research-backed: the churn × complexity signal has been validated in published studies.
+- Code health visualization and trend tracking.
+- Good at identifying where engineering investment will have the most impact.
+
+#### Limitations
+
+- Requires git history for churn analysis, which may not be available in uploaded archives.
+- Does not provide LLM-based synthesis or role-specific recommendations.
+- Less focused on cross-tool evidence consolidation.
+
+#### Relevance to our app
+
+CodeScene validates the value of combining complexity with temporal signals. Our MVP uses static complexity only. Adding churn × complexity (Phase 2) would significantly improve hotspot prioritization when git history or Bitbucket data becomes available.
+
+---
+
+### 3.10 Moderne
+
+#### Positioning
+
+Moderne is a large-scale automated code transformation and refactoring platform built on OpenRewrite. It is particularly focused on Java enterprise codebases and is used to apply large-scale refactors, dependency upgrades, and security remediations across many repositories simultaneously.
+
+#### Strengths
+
+- Can apply systematic Java refactoring at scale across an entire organization's codebase.
+- Recipes define repeatable, reversible transformations.
+- Well-suited for the kind of refactoring recommendations our platform generates.
+- Used in large Java-heavy enterprises, including some banks.
+
+#### Limitations
+
+- An execution tool, not an analysis or assessment tool.
+- Does not identify what to refactor or why.
+
+#### Relevance to our app
+
+Moderne is a potential future execution layer for our platform. When our platform recommends "extract this validation logic" or "upgrade this dependency pattern," Moderne can be the system that applies that change at scale. This is a compelling future integration story for a bank with many Java microservices.
+
+---
+
+### 3.11 Diffblue Cover
+
+#### Positioning
+
+Diffblue Cover is an AI-powered automated test generation tool for Java. It uses machine learning to analyze existing Java code and generate unit tests. It is used in banking and financial services, including early adoption at JPMC.
+
+#### Strengths
+
+- Demonstrates that AI-assisted tooling for Java in banking is viable and accepted by leadership.
+- Focuses on a concrete, measurable value: increasing test coverage without manual effort.
+- Relevant precedent for selling AI-assisted engineering tools in a regulated financial services context.
+
+#### Limitations
+
+- Focused solely on test generation, not quality assessment or refactoring recommendation.
+- Does not identify architecture risks or maintainability themes.
+
+#### Relevance to our app
+
+Diffblue Cover is a useful reference point for leadership conversations. If JPMC or similar institutions already use Diffblue, it validates the appetite for AI-powered Java tooling. Our platform can complement Diffblue by identifying which files have the highest test gap and therefore most benefit from automated test generation.
+
+---
+
+### 3.12 AI Code Review Products, such as CodeRabbit
 
 #### Positioning
 
@@ -411,19 +511,21 @@ The app gives managers and architecture reviewers a clear view of:
 
 ## 7. Differentiation of the Proposed App
 
-| Capability | Existing Scanners | Proposed Internal App |
-|---|---|---|
-| Static code quality metrics | Strong | Ingests and normalizes |
-| Security vulnerability detection | Strong | Ingests as risk signals |
-| Dependency risk | Strong in Snyk/Veracode | Ingests as risk signals |
-| Cross-tool synthesis | Limited | Core capability |
-| Repo-level quality themes | Limited | Core capability |
-| Refactor backlog generation | Limited | Core capability |
-| LLM-based engineering judgment | Limited or product-specific | Core capability, evidence-grounded |
-| LLM output evaluation | Usually limited | Core capability |
-| Internal tenant/repo governance | Tool-dependent | Designed for internal use |
-| Role-specific dashboard | Limited | Core capability |
-| Advisory quality intelligence | Partial | Core product goal |
+| Capability | Existing Scanners (Sonar/CodeQL/etc.) | CAST Highlight/Imaging | CodeScene | Proposed Internal App |
+|---|---|---|---|---|
+| Static code quality metrics | Strong | Strong | Moderate | Ingests and normalizes |
+| Security vulnerability detection | Strong | Limited | Limited | Ingests as risk signals |
+| Dependency risk | Strong in Snyk/Veracode | Limited | Limited | Ingests as risk signals |
+| Architecture visualization | Limited | Strong (CAST Imaging) | Limited | Phase 2 |
+| Churn × complexity hotspots | Limited | Limited | Strong | Phase 2 |
+| Cross-tool evidence synthesis | Limited | Limited | Limited | Core capability |
+| Repo-level quality themes with evidence | Limited | Partial | Partial | Core capability |
+| LLM-based engineering judgment | Limited or product-specific | Not available | Not available | Core capability, evidence-grounded |
+| LLM output validation and evaluation | Not applicable | Not applicable | Not applicable | Core capability |
+| Actionable refactor backlog | Limited | Partial | Partial | Core capability |
+| Internal governance and audit trail | Tool-dependent | Tool-dependent | External SaaS | Designed for internal use |
+| Role-specific dashboard (engineer/manager/arch) | Limited | Limited | Limited | Core capability |
+| Advisory quality intelligence | Partial | Partial | Partial | Core product goal |
 
 ---
 
@@ -435,11 +537,13 @@ The app should be positioned as:
 
 It should not be positioned as:
 
-> A replacement for SonarQube, CodeQL, Checkmarx, Snyk, or Veracode.
+> A replacement for SonarQube, CodeQL, Checkmarx, Snyk, Veracode, CAST, or CodeScene.
 
 A concise leadership-facing version:
 
-> We are not building another scanner. We are building an internal intelligence layer on top of approved scanners to help teams understand maintainability risk, prioritize refactoring, and track code health over time while keeping source code and LLM usage within approved internal controls.
+> We are not replacing enterprise scanners or architecture analysis products. We are building an internal intelligence layer that turns scanner outputs, code structure, and selected source evidence into prioritized, evidence-backed engineering recommendations — while keeping source code and LLM usage within approved internal controls.
+
+The platform is AI-assisted but engineering-controlled. Every important conclusion is grounded in evidence and passes deterministic validation before appearing in the final report.
 
 ---
 
